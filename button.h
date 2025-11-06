@@ -3,4 +3,4 @@
 
 void wait_button(void);
 
-#endif
+#endif // BUTTON_H
