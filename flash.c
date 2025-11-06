@@ -1,67 +1,45 @@
 #include "flash.h"
-#include "maze.h"
-#include "stm32f4xx_hal.h"
 
-/* Choose a safe flash address for storing maze.
-   WARNING: You must set this correctly to avoid overwriting program.
-   0x08020000 is an example; adjust based on your flash layout.
-*/
-#define FLASH_USER_START_ADDR   ((uint32_t)0x08020000)
-#define FLASH_USER_END_ADDR     ((uint32_t)0x08020FFF)
-#define FLASH_WORD_SIZE         4
-
-extern uint8_t maze[MAZE_SIZE][MAZE_SIZE];
-
-void save_maze_to_flash(void)
+HAL_StatusTypeDef Flash_Erase_Sector(uint32_t sector)
 {
+    HAL_StatusTypeDef status;
+    FLASH_EraseInitTypeDef eraseInitStruct;
+    uint32_t SectorError = 0;
+
     HAL_FLASH_Unlock();
 
-    // Erase necessary pages - simple approach: erase range
-    FLASH_EraseInitTypeDef EraseInitStruct;
-    uint32_t PageError = 0;
+    eraseInitStruct.TypeErase = FLASH_TYPEERASE_SECTORS;
+    eraseInitStruct.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+    eraseInitStruct.Sector = sector;
+    eraseInitStruct.NbSectors = 1;
 
-    EraseInitStruct.TypeErase = FLASH_TYPEERASE_SECTORS; // STM32F4 flash variant may differ
-    // For simplicity use mass erase style or use appropriate sector number. This is MCU dependent.
-    // TODO: Replace with proper erase for your MCU or use HAL_FLASHEx_Erase for sectors.
+    status = HAL_FLASHEx_Erase(&eraseInitStruct, &SectorError);
 
-    // Here we'll perform a simple word program (without explicit erase) ONLY if you know pages are free.
-    // Safer: erase page with proper API. Implementation depends on device flash layout.
+    HAL_FLASH_Lock();
+    return status;
+}
 
-    // Program data
-    uint32_t addr = FLASH_USER_START_ADDR;
-    uint8_t *p = (uint8_t*)maze;
-    uint32_t len = MAZE_SIZE * MAZE_SIZE;
+HAL_StatusTypeDef Flash_Write_Array(uint32_t address, uint8_t *data, uint32_t size)
+{
+    HAL_StatusTypeDef status = HAL_OK;
+    HAL_FLASH_Unlock();
 
-    for(uint32_t i=0;i<len;i+=FLASH_WORD_SIZE)
+    for (uint32_t i = 0; i < size; i += 1)
     {
-        uint32_t word = 0xFFFFFFFF;
-        // pack up to 4 bytes
-        for(int b=0;b<4;b++){
-            uint32_t idx = i + b;
-            uint8_t byte = 0xFF;
-            if(idx < len) byte = p[idx];
-            word |= ((uint32_t)byte) << (8*b);
-        }
-
-        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i, (uint64_t)word) != HAL_OK)
-        {
-            // handle error
-            HAL_FLASH_Lock();
-            return;
-        }
+        status = HAL_FLASH_Program(TYPEPROGRAM_BYTE, address + i, data[i]);
+        if (status != HAL_OK)
+            break;
     }
 
     HAL_FLASH_Lock();
+    return status;
 }
 
-void load_maze_from_flash(void)
+HAL_StatusTypeDef Flash_Read_Array(uint32_t address, uint8_t *data, uint32_t size)
 {
-    uint32_t addr = FLASH_USER_START_ADDR;
-    uint8_t *p = (uint8_t*)maze;
-    uint32_t len = MAZE_SIZE * MAZE_SIZE;
-
-    for(uint32_t i=0;i<len;i++)
+    for (uint32_t i = 0; i < size; i++)
     {
-        p[i] = *((uint8_t*)(addr + i));
+        data[i] = *(volatile uint8_t *)(address + i);
     }
+    return HAL_OK;
 }
