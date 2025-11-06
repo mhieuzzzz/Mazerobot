@@ -1,8 +1,7 @@
 #include "maze.h"
-#include "flash.h"
 #include "motor.h"
 #include "ir_sensor.h"
-#include "fast_run.h"
+#include "flash.h"
 #include "main.h"
 
 #define MAZE_SIZE 16
@@ -11,61 +10,78 @@ Cell maze[MAZE_SIZE][MAZE_SIZE];
 uint8_t current_x = 0, current_y = 0;
 uint8_t direction = 0; // 0: North, 1: East, 2: South, 3: West
 
-void maze_init(void)
-{
-    for (int y = 0; y < MAZE_SIZE; y++)
-        for (int x = 0; x < MAZE_SIZE; x++)
-        {
-            maze[y][x].wall_north = 0;
-            maze[y][x].wall_east  = 0;
-            maze[y][x].wall_south = 0;
-            maze[y][x].wall_west  = 0;
-            maze[y][x].visited    = 0;
-        }
-}
-
 void learn_maze(void)
 {
     maze_init();
     current_x = 0;
     current_y = 0;
-    direction = 0; // bắt đầu hướng Bắc
+    direction = 0;
 
     while (1)
     {
+        // Đọc cảm biến
         read_ir_sensors();
-        maze[current_y][current_x].visited = 1;
 
-        // Giả lập đọc tường (thực tế đọc giá trị ADC IR)
+        // Ghi nhận tường theo hướng hiện tại
         if (front_wall_detected())  maze[current_y][current_x].wall_north = 1;
         if (left_wall_detected())   maze[current_y][current_x].wall_west = 1;
         if (right_wall_detected())  maze[current_y][current_x].wall_east = 1;
 
-        // di chuyển sang ô mới
-        motor_forward(50);
-        HAL_Delay(500);
-        motor_stop();
+        maze[current_y][current_x].visited = 1;
 
-        current_y++;
-        if (current_y >= MAZE_SIZE - 1) break; // dừng học đơn giản
+        // Debug LED
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        HAL_Delay(100);
 
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // debug LED
+        // Nếu phía trước không có tường → tiến tới
+        if (!front_wall_detected())
+        {
+            motor_forward(50);
+            HAL_Delay(600);
+            motor_stop();
+
+            if (direction == 0) current_y++;
+            else if (direction == 1) current_x++;
+            else if (direction == 2 && current_y > 0) current_y--;
+            else if (direction == 3 && current_x > 0) current_x--;
+        }
+        else
+        {
+            // Gặp tường: rẽ phải nếu có thể, nếu không thì trái
+            if (!right_wall_detected())
+            {
+                motor_turn_right(50);
+                HAL_Delay(400);
+                motor_stop();
+                direction = (direction + 1) % 4;
+            }
+            else if (!left_wall_detected())
+            {
+                motor_turn_left(50);
+                HAL_Delay(400);
+                motor_stop();
+                direction = (direction + 3) % 4;
+            }
+            else
+            {
+                // Bế tắc -> quay đầu
+                motor_turn_left(50);
+                HAL_Delay(800);
+                motor_stop();
+                direction = (direction + 2) % 4;
+            }
+        }
+
+        // Dừng nếu đã khám phá hết một đoạn (ví dụ 8x8)
+        if (current_x >= 8 && current_y >= 8)
+            break;
     }
 
+    // Lưu map vào Flash
     save_maze_to_flash();
-}
 
-void save_maze_to_flash(void)
-{
-    HAL_StatusTypeDef status;
-    status = Flash_Erase_Sector(FLASH_SECTOR_USED);
-    if (status == HAL_OK)
-    {
-        Flash_Write_Array(FLASH_SECTOR_ADDR, (uint8_t *)maze, sizeof(maze));
-    }
-}
-
-void load_maze_from_flash(void)
-{
-    Flash_Read_Array(FLASH_SECTOR_ADDR, (uint8_t *)maze, sizeof(maze));
+    // Báo hoàn thành
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(300);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
 }
