@@ -6,4 +6,4 @@ void led_off(void);
 void buzzer_on(void);
 void buzzer_off(void);
 
-#endif
+#endif // BUZZER_LED_H
