@@ -3,4 +3,4 @@
 
 void fast_run(void);
 
-#endif
+#endif // FAST_RUN_H
