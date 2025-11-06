@@ -1,1 +1,869 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Maze Solving Robot for STM32F411CEU6
+  * @author         : Maze Robot Project
+  * @date           : 2025
+  ******************************************************************************
+  * Hardware Configuration:
+  * - IR LEDs: PA0, PA1, PA2, PA3 (PWM - TIM2)
+  * - IR Sensors: PA4, PA5, PA6, PA7 (ADC1)
+  * - Motor PWM: TIM3 (Motor driver SN754410NE)
+  * - Encoders: PB6, PB7 (Right), PB3, PA15 (Left)
+  * - LED Test: PC13
+  * - Buzzer: PB4
+  * - Button: PA10 (Pull-up)
+  ******************************************************************************
+  */
+/* USER CODE END Header */
 
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <string.h>
+#include <math.h>
+
+/* Private define ------------------------------------------------------------*/
+#define MAZE_SIZE 10
+#define CELL_SIZE_MM 200
+#define IR_SAMPLES 20
+#define IR_THRESHOLD 2000  // Ngưỡng phát hiện tường (cần điều chỉnh)
+#define EMA_ALPHA 0.3f
+
+#define MOTOR_BASE_SPEED 50
+#define MOTOR_MAX_SPEED 100
+#define ENCODER_TICKS_PER_CELL 1000  // Số xung encoder cho 1 ô (cần hiệu chuẩn)
+
+/* Private typedef -----------------------------------------------------------*/
+typedef enum {
+  NORTH = 0,
+  EAST = 1,
+  SOUTH = 2,
+  WEST = 3
+} Direction;
+
+typedef struct {
+  uint8_t north : 1;
+  uint8_t east : 1;
+  uint8_t south : 1;
+  uint8_t west : 1;
+  uint8_t visited : 1;
+  uint16_t distance;
+} Cell;
+
+typedef struct {
+  int8_t x;
+  int8_t y;
+  Direction dir;
+} Position;
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
+TIM_HandleTypeDef htim2;  // PWM for IR LEDs
+TIM_HandleTypeDef htim3;  // PWM for Motors
+TIM_HandleTypeDef htim4;  // Encoder Left
+TIM_HandleTypeDef htim5;  // Encoder Right
+
+// Maze data
+Cell maze[MAZE_SIZE][MAZE_SIZE];
+Position current_pos = {0, 0, NORTH};
+uint8_t map_explored = 0;
+
+// IR Sensor readings
+uint16_t adc_buffer[4];
+uint16_t ir_values[4];
+float ir_ema[4] = {0, 0, 0, 0};
+
+// Encoder counters
+volatile int32_t encoder_left = 0;
+volatile int32_t encoder_right = 0;
+
+// Button state
+volatile uint8_t button_pressed = 0;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_TIM5_Init(void);
+
+// Robot control functions
+void IR_ReadSensors(void);
+uint8_t IR_DetectWall(uint8_t sensor);
+void Motor_SetSpeed(int16_t left_speed, int16_t right_speed);
+void Motor_Stop(void);
+void Robot_MoveForward(void);
+void Robot_TurnLeft(void);
+void Robot_TurnRight(void);
+void Robot_TurnAround(void);
+void Buzzer_Beep(uint16_t duration_ms);
+
+// Maze solving functions
+void Maze_Init(void);
+void Maze_UpdateWalls(void);
+void Maze_FloodFill(uint8_t target_x, uint8_t target_y);
+void Maze_Explore(void);
+void Maze_RunFastPath(void);
+Direction Maze_GetNextMove(void);
+
+/* Private user code ---------------------------------------------------------*/
+
+/**
+  * @brief  The application entry point.
+  */
+int main(void)
+{
+  /* MCU Configuration--------------------------------------------------------*/
+  HAL_Init();
+  SystemClock_Config();
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  MX_TIM4_Init();
+  MX_TIM5_Init();
+
+  /* Start peripherals */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);  // IR LED PA0
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);  // IR LED PA1
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);  // IR LED PA2
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);  // IR LED PA3
+  
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // Motor Left
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);  // Motor Right
+  
+  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);  // Encoder Left
+  HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);  // Encoder Right
+  
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, 4);
+
+  /* Initialize maze */
+  Maze_Init();
+  
+  /* LED test - blink 3 times */
+  for(int i = 0; i < 3; i++) {
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    HAL_Delay(200);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    HAL_Delay(200);
+  }
+  
+  Buzzer_Beep(100);
+  HAL_Delay(500);
+
+  /* Phase 1: Explore maze */
+  if(!map_explored) {
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  // LED on during explore
+    Maze_Explore();
+    map_explored = 1;
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);  // LED off
+    Buzzer_Beep(200);
+    HAL_Delay(100);
+    Buzzer_Beep(200);
+  }
+
+  /* Phase 2: Wait for button press to run fast path */
+  while(1) {
+    if(button_pressed) {
+      button_pressed = 0;
+      HAL_Delay(500);  // Debounce
+      
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+      Buzzer_Beep(100);
+      HAL_Delay(1000);
+      
+      // Reset position
+      current_pos.x = 0;
+      current_pos.y = 0;
+      current_pos.dir = NORTH;
+      
+      Maze_RunFastPath();
+      
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+      Buzzer_Beep(500);
+    }
+    HAL_Delay(100);
+  }
+}
+
+/**
+  * @brief Read IR sensors with filtering
+  */
+void IR_ReadSensors(void)
+{
+  uint32_t sum[4] = {0, 0, 0, 0};
+  
+  // Read each sensor with its LED on
+  for(int led = 0; led < 4; led++) {
+    // Turn on specific LED
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (led == 0) ? 800 : 0);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (led == 1) ? 800 : 0);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, (led == 2) ? 800 : 0);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, (led == 3) ? 800 : 0);
+    
+    HAL_Delay(1);  // Stabilize
+    
+    // Read multiple samples
+    for(int i = 0; i < IR_SAMPLES; i++) {
+      HAL_ADC_PollForConversion(&hadc1, 10);
+      sum[led] += adc_buffer[led];
+    }
+    
+    // Average
+    ir_values[led] = sum[led] / IR_SAMPLES;
+    
+    // EMA filter
+    ir_ema[led] = EMA_ALPHA * ir_values[led] + (1.0f - EMA_ALPHA) * ir_ema[led];
+  }
+  
+  // Turn off all LEDs
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, 0);
+}
+
+/**
+  * @brief Detect wall from IR sensor
+  */
+uint8_t IR_DetectWall(uint8_t sensor)
+{
+  return (ir_ema[sensor] > IR_THRESHOLD) ? 1 : 0;
+}
+
+/**
+  * @brief Set motor speeds (-100 to 100)
+  */
+void Motor_SetSpeed(int16_t left_speed, int16_t right_speed)
+{
+  // Limit speeds
+  if(left_speed > 100) left_speed = 100;
+  if(left_speed < -100) left_speed = -100;
+  if(right_speed > 100) right_speed = 100;
+  if(right_speed < -100) right_speed = -100;
+  
+  // Convert to PWM (0-1000)
+  uint16_t left_pwm = abs(left_speed) * 10;
+  uint16_t right_pwm = abs(right_speed) * 10;
+  
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, left_pwm);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, right_pwm);
+  
+  // Direction control with GPIO (configure in CubeMX)
+  // Implement motor direction control here if needed
+}
+
+/**
+  * @brief Stop motors
+  */
+void Motor_Stop(void)
+{
+  Motor_SetSpeed(0, 0);
+}
+
+/**
+  * @brief Move forward one cell
+  */
+void Robot_MoveForward(void)
+{
+  encoder_left = 0;
+  encoder_right = 0;
+  
+  while(encoder_left < ENCODER_TICKS_PER_CELL && encoder_right < ENCODER_TICKS_PER_CELL) {
+    Motor_SetSpeed(MOTOR_BASE_SPEED, MOTOR_BASE_SPEED);
+    
+    // Simple PID to keep straight
+    int32_t error = encoder_left - encoder_right;
+    Motor_SetSpeed(MOTOR_BASE_SPEED - error/10, MOTOR_BASE_SPEED + error/10);
+    
+    HAL_Delay(10);
+  }
+  
+  Motor_Stop();
+  HAL_Delay(100);
+  
+  // Update position
+  switch(current_pos.dir) {
+    case NORTH: current_pos.y++; break;
+    case EAST:  current_pos.x++; break;
+    case SOUTH: current_pos.y--; break;
+    case WEST:  current_pos.x--; break;
+  }
+}
+
+/**
+  * @brief Turn left 90 degrees
+  */
+void Robot_TurnLeft(void)
+{
+  encoder_left = 0;
+  encoder_right = 0;
+  
+  int32_t turn_ticks = ENCODER_TICKS_PER_CELL / 4;  // Adjust for 90 degree turn
+  
+  while(encoder_left < turn_ticks || encoder_right < turn_ticks) {
+    Motor_SetSpeed(-MOTOR_BASE_SPEED, MOTOR_BASE_SPEED);
+    HAL_Delay(10);
+  }
+  
+  Motor_Stop();
+  HAL_Delay(100);
+  
+  current_pos.dir = (current_pos.dir + 3) % 4;  // Turn left
+}
+
+/**
+  * @brief Turn right 90 degrees
+  */
+void Robot_TurnRight(void)
+{
+  encoder_left = 0;
+  encoder_right = 0;
+  
+  int32_t turn_ticks = ENCODER_TICKS_PER_CELL / 4;
+  
+  while(encoder_left < turn_ticks || encoder_right < turn_ticks) {
+    Motor_SetSpeed(MOTOR_BASE_SPEED, -MOTOR_BASE_SPEED);
+    HAL_Delay(10);
+  }
+  
+  Motor_Stop();
+  HAL_Delay(100);
+  
+  current_pos.dir = (current_pos.dir + 1) % 4;  // Turn right
+}
+
+/**
+  * @brief Turn 180 degrees
+  */
+void Robot_TurnAround(void)
+{
+  Robot_TurnRight();
+  Robot_TurnRight();
+}
+
+/**
+  * @brief Beep buzzer
+  */
+void Buzzer_Beep(uint16_t duration_ms)
+{
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+  HAL_Delay(duration_ms);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
+}
+
+/**
+  * @brief Initialize maze array
+  */
+void Maze_Init(void)
+{
+  for(int x = 0; x < MAZE_SIZE; x++) {
+    for(int y = 0; y < MAZE_SIZE; y++) {
+      maze[x][y].north = 0;
+      maze[x][y].east = 0;
+      maze[x][y].south = 0;
+      maze[x][y].west = 0;
+      maze[x][y].visited = 0;
+      maze[x][y].distance = 255;
+      
+      // Boundary walls
+      if(y == MAZE_SIZE - 1) maze[x][y].north = 1;
+      if(x == MAZE_SIZE - 1) maze[x][y].east = 1;
+      if(y == 0) maze[x][y].south = 1;
+      if(x == 0) maze[x][y].west = 1;
+    }
+  }
+}
+
+/**
+  * @brief Update maze walls based on IR sensors
+  * Sensors: 0=Right-Front, 1=Right-Right, 2=Left-Left, 3=Left-Front
+  */
+void Maze_UpdateWalls(void)
+{
+  IR_ReadSensors();
+  
+  int8_t x = current_pos.x;
+  int8_t y = current_pos.y;
+  Direction dir = current_pos.dir;
+  
+  // Map sensor readings to walls based on current direction
+  uint8_t front_wall = IR_DetectWall(0) || IR_DetectWall(3);
+  uint8_t right_wall = IR_DetectWall(1);
+  uint8_t left_wall = IR_DetectWall(2);
+  
+  // Update current cell walls
+  switch(dir) {
+    case NORTH:
+      maze[x][y].north = front_wall;
+      maze[x][y].east = right_wall;
+      maze[x][y].west = left_wall;
+      if(front_wall && y < MAZE_SIZE-1) maze[x][y+1].south = 1;
+      if(right_wall && x < MAZE_SIZE-1) maze[x+1][y].west = 1;
+      if(left_wall && x > 0) maze[x-1][y].east = 1;
+      break;
+    case EAST:
+      maze[x][y].east = front_wall;
+      maze[x][y].south = right_wall;
+      maze[x][y].north = left_wall;
+      if(front_wall && x < MAZE_SIZE-1) maze[x+1][y].west = 1;
+      if(right_wall && y > 0) maze[x][y-1].north = 1;
+      if(left_wall && y < MAZE_SIZE-1) maze[x][y+1].south = 1;
+      break;
+    case SOUTH:
+      maze[x][y].south = front_wall;
+      maze[x][y].west = right_wall;
+      maze[x][y].east = left_wall;
+      if(front_wall && y > 0) maze[x][y-1].north = 1;
+      if(right_wall && x > 0) maze[x-1][y].east = 1;
+      if(left_wall && x < MAZE_SIZE-1) maze[x+1][y].west = 1;
+      break;
+    case WEST:
+      maze[x][y].west = front_wall;
+      maze[x][y].north = right_wall;
+      maze[x][y].south = left_wall;
+      if(front_wall && x > 0) maze[x-1][y].east = 1;
+      if(right_wall && y < MAZE_SIZE-1) maze[x][y+1].south = 1;
+      if(left_wall && y > 0) maze[x][y-1].north = 1;
+      break;
+  }
+  
+  maze[x][y].visited = 1;
+}
+
+/**
+  * @brief Flood fill algorithm to calculate distances from target
+  */
+void Maze_FloodFill(uint8_t target_x, uint8_t target_y)
+{
+  // Reset distances
+  for(int x = 0; x < MAZE_SIZE; x++) {
+    for(int y = 0; y < MAZE_SIZE; y++) {
+      maze[x][y].distance = 255;
+    }
+  }
+  
+  // Simple BFS flood fill
+  maze[target_x][target_y].distance = 0;
+  
+  uint8_t changed = 1;
+  while(changed) {
+    changed = 0;
+    for(int x = 0; x < MAZE_SIZE; x++) {
+      for(int y = 0; y < MAZE_SIZE; y++) {
+        if(maze[x][y].distance < 255) {
+          uint16_t new_dist = maze[x][y].distance + 1;
+          
+          // Check neighbors
+          if(!maze[x][y].north && y < MAZE_SIZE-1 && maze[x][y+1].distance > new_dist) {
+            maze[x][y+1].distance = new_dist;
+            changed = 1;
+          }
+          if(!maze[x][y].east && x < MAZE_SIZE-1 && maze[x+1][y].distance > new_dist) {
+            maze[x+1][y].distance = new_dist;
+            changed = 1;
+          }
+          if(!maze[x][y].south && y > 0 && maze[x][y-1].distance > new_dist) {
+            maze[x][y-1].distance = new_dist;
+            changed = 1;
+          }
+          if(!maze[x][y].west && x > 0 && maze[x-1][y].distance > new_dist) {
+            maze[x-1][y].distance = new_dist;
+            changed = 1;
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+  * @brief Get next move direction based on flood fill
+  */
+Direction Maze_GetNextMove(void)
+{
+  int8_t x = current_pos.x;
+  int8_t y = current_pos.y;
+  uint16_t min_dist = 255;
+  Direction best_dir = current_pos.dir;
+  
+  // Check all accessible neighbors
+  if(!maze[x][y].north && y < MAZE_SIZE-1 && maze[x][y+1].distance < min_dist) {
+    min_dist = maze[x][y+1].distance;
+    best_dir = NORTH;
+  }
+  if(!maze[x][y].east && x < MAZE_SIZE-1 && maze[x+1][y].distance < min_dist) {
+    min_dist = maze[x+1][y].distance;
+    best_dir = EAST;
+  }
+  if(!maze[x][y].south && y > 0 && maze[x][y-1].distance < min_dist) {
+    min_dist = maze[x][y-1].distance;
+    best_dir = SOUTH;
+  }
+  if(!maze[x][y].west && x > 0 && maze[x-1][y].distance < min_dist) {
+    min_dist = maze[x-1][y].distance;
+    best_dir = WEST;
+  }
+  
+  return best_dir;
+}
+
+/**
+  * @brief Explore maze using flood fill algorithm
+  */
+void Maze_Explore(void)
+{
+  uint8_t target_x = MAZE_SIZE / 2;
+  uint8_t target_y = MAZE_SIZE / 2;
+  
+  while(current_pos.x != target_x || current_pos.y != target_y) {
+    // Update walls at current position
+    Maze_UpdateWalls();
+    
+    // Recalculate distances
+    Maze_FloodFill(target_x, target_y);
+    
+    // Get next move
+    Direction next_dir = Maze_GetNextMove();
+    
+    // Turn to face next direction
+    while(current_pos.dir != next_dir) {
+      int8_t turn_diff = (next_dir - current_pos.dir + 4) % 4;
+      if(turn_diff == 1) Robot_TurnRight();
+      else if(turn_diff == 3) Robot_TurnLeft();
+      else if(turn_diff == 2) Robot_TurnAround();
+    }
+    
+    // Move forward
+    Robot_MoveForward();
+    
+    HAL_Delay(100);
+  }
+  
+  // Reached center
+  Maze_UpdateWalls();
+}
+
+/**
+  * @brief Run fast path after exploration
+  */
+void Maze_RunFastPath(void)
+{
+  uint8_t target_x = MAZE_SIZE / 2;
+  uint8_t target_y = MAZE_SIZE / 2;
+  
+  Maze_FloodFill(target_x, target_y);
+  
+  while(current_pos.x != target_x || current_pos.y != target_y) {
+    Direction next_dir = Maze_GetNextMove();
+    
+    // Turn to face next direction
+    while(current_pos.dir != next_dir) {
+      int8_t turn_diff = (next_dir - current_pos.dir + 4) % 4;
+      if(turn_diff == 1) Robot_TurnRight();
+      else if(turn_diff == 3) Robot_TurnLeft();
+      else if(turn_diff == 2) Robot_TurnAround();
+    }
+    
+    Robot_MoveForward();
+    HAL_Delay(50);  // Faster movement
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 25;
+  RCC_OscInitStruct.PLL.PLLN = 192;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3);
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  */
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 4;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  HAL_ADC_Init(&hadc1);
+
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = 2;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = 3;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+  sConfig.Channel = ADC_CHANNEL_7;
+  sConfig.Rank = 4;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+}
+
+/**
+  * @brief TIM2 Initialization Function (PWM for IR LEDs)
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 96-1;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 1000-1;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  HAL_TIM_Base_Init(&htim2);
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig);
+
+  HAL_TIM_PWM_Init(&htim2);
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig);
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1);
+  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2);
+  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3);
+  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4);
+}
+
+/**
+  * @brief TIM3 Initialization Function (PWM for Motors)
+  */
+static void MX_TIM3_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 96-1;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 1000-1;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  HAL_TIM_Base_Init(&htim3);
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig);
+
+  HAL_TIM_PWM_Init(&htim3);
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig);
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1);
+  HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2);
+}
+
+/**
+  * @brief TIM4 Initialization Function (Encoder Left)
+  */
+static void MX_TIM4_Init(void)
+{
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 0;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 65535;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 10;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 10;
+  HAL_TIM_Encoder_Init(&htim4, &sConfig);
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig);
+}
+
+/**
+  * @brief TIM5 Initialization Function (Encoder Right)
+  */
+static void MX_TIM5_Init(void)
+{
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 0;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 65535;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 10;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 10;
+  HAL_TIM_Encoder_Init(&htim5, &sConfig);
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig);
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+}
+
+/**
+  * @brief GPIO Initialization Function
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /* Configure GPIO pin : PC13 (LED) */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* Configure GPIO pin : PA10 (Button) */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* Configure GPIO pin : PB4 (Buzzer) */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+/**
+  * @brief GPIO EXTI Callback
+  */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if(GPIO_Pin == GPIO_PIN_10) {
+    button_pressed = 1;
+  }
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if(htim->Instance == TIM4) {
+    encoder_left = __HAL_TIM_GET_COUNTER(&htim4);
+  }
+  if(htim->Instance == TIM5) {
+    encoder_right = __HAL_TIM_GET_COUNTER(&htim5);
+  }
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    HAL_Delay(100);
+  }
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif /* USE_FULL_ASSERT */
